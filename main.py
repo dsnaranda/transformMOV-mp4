@@ -86,7 +86,7 @@ class WorkerThread(QThread):
             cmd,
             stderr=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            text=True
+            text=True,
         )
 
         duration = None
@@ -138,7 +138,7 @@ class WorkerThread(QThread):
             cmd,
             stderr=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            text=True
+            text=True,
         )
 
         for line in self.process.stderr:
