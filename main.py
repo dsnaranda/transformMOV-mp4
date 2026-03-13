@@ -2,19 +2,28 @@ import sys
 import os
 import subprocess
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 import imageio_ffmpeg as ffmpeg
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton,
-    QListWidget, QFileDialog, QLabel, QProgressBar,
-    QMessageBox
+    QTableWidget, QTableWidgetItem, QFileDialog, QLabel,
+    QProgressBar, QMessageBox, QHBoxLayout, QHeaderView,
+    QComboBox
 )
 
 from PySide6.QtCore import Qt, QThread, Signal
 
 
-class DropList(QListWidget):
+def format_size(path):
+    size = os.path.getsize(path) / (1024 * 1024)
+    return f"{size:.1f} MB"
+
+
+class DropTable(QTableWidget):
+
+    files_dropped = Signal(list)
 
     def __init__(self):
         super().__init__()
@@ -29,34 +38,35 @@ class DropList(QListWidget):
 
     def dropEvent(self, event):
 
+        paths = []
+
         for url in event.mimeData().urls():
+            paths.append(url.toLocalFile())
 
-            path = url.toLocalFile()
-
-            if path.lower().endswith(".mov"):
-                self.addItem(path)
+        self.files_dropped.emit(paths)
 
 
-class ConverterThread(QThread):
+class WorkerThread(QThread):
 
-    file_progress = Signal(int)
-    total_progress = Signal(int)
-    finished = Signal()
+    progress = Signal(int, int)
+    status = Signal(str)
+    finished = Signal(int)
 
-    def __init__(self, files, output_folder):
+    def __init__(self, index, file, output_folder, crf):
         super().__init__()
 
-        self.files = files
+        self.index = index
+        self.file = file
         self.output_folder = output_folder
+        self.crf = crf
+
         self.ffmpeg_path = ffmpeg.get_ffmpeg_exe()
+        self.process = None
+        self.running = True
 
-    def get_duration(self, file):
+    def get_duration(self):
 
-        cmd = [
-            self.ffmpeg_path,
-            "-i",
-            file
-        ]
+        cmd = [self.ffmpeg_path, "-i", self.file]
 
         process = subprocess.Popen(
             cmd,
@@ -68,6 +78,7 @@ class ConverterThread(QThread):
         duration = None
 
         for line in process.stderr:
+
             if "Duration" in line:
                 duration = line
                 break
@@ -90,65 +101,72 @@ class ConverterThread(QThread):
 
     def run(self):
 
-        total_files = len(self.files)
+        name = os.path.basename(self.file)
 
-        for index, file in enumerate(self.files):
+        duration = self.get_duration()
 
-            duration = self.get_duration(file)
+        output = os.path.join(
+            self.output_folder,
+            os.path.splitext(name)[0] + ".mp4"
+        )
 
-            name = os.path.splitext(os.path.basename(file))[0]
-            output = os.path.join(self.output_folder, name + ".mp4")
+        cmd = [
+            self.ffmpeg_path,
+            "-i", self.file,
+            "-vcodec", "libx264",
+            "-crf", str(self.crf),
+            "-preset", "fast",
+            "-acodec", "aac",
+            output
+        ]
 
-            cmd = [
-                self.ffmpeg_path,
-                "-i",
-                file,
-                "-vcodec",
-                "libx264",
-                "-acodec",
-                "aac",
-                "-preset",
-                "fast",
-                output
-            ]
+        self.process = subprocess.Popen(
+            cmd,
+            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True
+        )
 
-            process = subprocess.Popen(
-                cmd,
-                stderr=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                text=True
-            )
+        for line in self.process.stderr:
 
-            for line in process.stderr:
+            if not self.running:
+                self.process.terminate()
+                return
 
-                if "time=" in line:
+            if "time=" in line:
 
-                    match = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", line)
+                match = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", line)
 
-                    if match:
+                if match:
 
-                        h = float(match.group(1))
-                        m = float(match.group(2))
-                        s = float(match.group(3))
+                    h = float(match.group(1))
+                    m = float(match.group(2))
+                    s = float(match.group(3))
 
-                        current = h * 3600 + m * 60 + s
+                    current = h * 3600 + m * 60 + s
 
-                        if duration > 0:
+                    if duration > 0:
 
-                            percent = int((current / duration) * 100)
+                        percent = int((current / duration) * 100)
 
-                            if percent > 100:
-                                percent = 100
+                        if percent > 100:
+                            percent = 100
 
-                            self.file_progress.emit(percent)
+                        self.progress.emit(self.index, percent)
 
-            process.wait()
+            speed_match = re.search(r"speed=\s*([0-9\.x]+)", line)
 
-            total_percent = int(((index + 1) / total_files) * 100)
+            if speed_match:
+                self.status.emit(f"{name}  ({speed_match.group(1)})")
 
-            self.total_progress.emit(total_percent)
+        self.process.wait()
 
-        self.finished.emit()
+        self.progress.emit(self.index, 100)
+        self.finished.emit(self.index)
+
+    def stop(self):
+
+        self.running = False
 
 
 class Window(QWidget):
@@ -156,34 +174,116 @@ class Window(QWidget):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Conversor MOV → MP4")
-        self.resize(600, 450)
+        self.setWindowTitle("Batch Video Converter")
+        self.resize(900, 600)
+
+        self.files = {}
+        self.workers = []
+        self.running = False
 
         layout = QVBoxLayout()
 
-        self.label = QLabel("Arrastra archivos .MOV aquí")
-        layout.addWidget(self.label)
+        label = QLabel("Arrastra archivos o carpetas con videos .MOV")
+        layout.addWidget(label)
 
-        self.list_files = DropList()
-        layout.addWidget(self.list_files)
+        self.table = DropTable()
+        self.table.setColumnCount(4)
 
-        btn_add = QPushButton("Agregar archivos")
-        btn_add.clicked.connect(self.add_files)
-        layout.addWidget(btn_add)
+        self.table.setHorizontalHeaderLabels(
+            ["Archivo", "Tamaño", "Progreso", "Ruta"]
+        )
 
-        self.file_progress = QProgressBar()
-        self.file_progress.setFormat("Progreso archivo: %p%")
-        layout.addWidget(self.file_progress)
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Stretch
+        )
+
+        self.table.files_dropped.connect(self.process_paths)
+
+        layout.addWidget(self.table)
+
+        buttons = QHBoxLayout()
+
+        add_btn = QPushButton("Agregar archivos")
+        add_btn.clicked.connect(self.add_files)
+
+        remove_btn = QPushButton("Eliminar")
+        remove_btn.clicked.connect(self.remove_selected)
+
+        buttons.addWidget(add_btn)
+        buttons.addWidget(remove_btn)
+
+        layout.addLayout(buttons)
+
+        self.quality = QComboBox()
+        self.quality.addItems([
+            "Alta calidad",
+            "Balanceado",
+            "Compacto"
+        ])
+
+        layout.addWidget(self.quality)
 
         self.total_progress = QProgressBar()
-        self.total_progress.setFormat("Progreso total: %p%")
         layout.addWidget(self.total_progress)
 
-        btn_convert = QPushButton("Convertir")
-        btn_convert.clicked.connect(self.convert)
-        layout.addWidget(btn_convert)
+        self.status = QLabel("Esperando archivos")
+        layout.addWidget(self.status)
+
+        control_buttons = QHBoxLayout()
+
+        self.convert_btn = QPushButton("Convertir")
+        self.convert_btn.clicked.connect(self.convert)
+
+        self.cancel_btn = QPushButton("Cancelar")
+        self.cancel_btn.clicked.connect(self.cancel)
+
+        control_buttons.addWidget(self.convert_btn)
+        control_buttons.addWidget(self.cancel_btn)
+
+        layout.addLayout(control_buttons)
 
         self.setLayout(layout)
+
+    def process_paths(self, paths):
+
+        mov_files = []
+
+        for path in paths:
+
+            if os.path.isfile(path) and path.lower().endswith(".mov"):
+                mov_files.append(path)
+
+            elif os.path.isdir(path):
+
+                for root, _, files in os.walk(path):
+
+                    for f in files:
+
+                        if f.lower().endswith(".mov"):
+                            mov_files.append(os.path.join(root, f))
+
+        self.add_to_table(mov_files)
+
+    def add_to_table(self, files):
+
+        for file in files:
+
+            if file in self.files:
+                continue
+
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+
+            self.table.setItem(row, 0, QTableWidgetItem(os.path.basename(file)))
+            self.table.setItem(row, 1, QTableWidgetItem(format_size(file)))
+            self.table.setItem(row, 3, QTableWidgetItem(file))
+
+            progress = QProgressBar()
+            progress.setValue(0)
+
+            self.table.setCellWidget(row, 2, progress)
+
+            self.files[file] = True
 
     def add_files(self):
 
@@ -194,55 +294,116 @@ class Window(QWidget):
             "Videos (*.mov)"
         )
 
-        for f in files:
-            self.list_files.addItem(f)
+        self.add_to_table(files)
+
+    def remove_selected(self):
+
+        rows = sorted(
+            set(index.row() for index in self.table.selectedIndexes()),
+            reverse=True
+        )
+
+        for row in rows:
+
+            path = self.table.item(row, 3).text()
+
+            if path in self.files:
+                del self.files[path]
+
+            self.table.removeRow(row)
 
     def convert(self):
 
-        if self.list_files.count() == 0:
-
-            QMessageBox.warning(
-                self,
-                "Error",
-                "No hay archivos para convertir"
-            )
-
+        if self.running:
             return
 
         folder = QFileDialog.getExistingDirectory(
             self,
-            "Seleccionar carpeta destino"
+            "Carpeta destino"
         )
 
         if not folder:
             return
 
-        files = []
+        quality_map = {
+            "Alta calidad": 18,
+            "Balanceado": 23,
+            "Compacto": 28
+        }
 
-        for i in range(self.list_files.count()):
-            files.append(self.list_files.item(i).text())
+        crf = quality_map[self.quality.currentText()]
 
-        self.thread = ConverterThread(files, folder)
+        self.running = True
 
-        self.thread.file_progress.connect(self.file_progress.setValue)
-        self.thread.total_progress.connect(self.total_progress.setValue)
+        total = self.table.rowCount()
 
-        self.thread.finished.connect(self.finish_message)
+        for row in range(total):
 
-        self.thread.start()
+            file = self.table.item(row, 3).text()
 
-    def finish_message(self):
+            worker = WorkerThread(row, file, folder, crf)
 
-        QMessageBox.information(
-            self,
-            "Completado",
-            "Todos los videos fueron convertidos"
-        )
+            worker.progress.connect(self.update_progress)
+            worker.status.connect(self.status.setText)
+            worker.finished.connect(self.file_finished)
+
+            self.workers.append(worker)
+
+            worker.start()
+
+    def update_progress(self, row, percent):
+
+        progress = self.table.cellWidget(row, 2)
+        progress.setValue(percent)
+
+        total = 0
+
+        for r in range(self.table.rowCount()):
+            total += self.table.cellWidget(r, 2).value()
+
+        total = int(total / self.table.rowCount())
+
+        self.total_progress.setValue(total)
+
+    def file_finished(self, row):
+
+        self.status.setText("Archivo terminado")
+
+    def cancel(self):
+
+        for worker in self.workers:
+            worker.stop()
+
+        self.running = False
+        self.status.setText("Conversión cancelada")
 
 
 if __name__ == "__main__":
 
     app = QApplication(sys.argv)
+
+    app.setStyleSheet("""
+
+    QWidget {
+        background-color: #1e1e1e;
+        color: white;
+    }
+
+    QPushButton {
+        background-color: #2d2d2d;
+        border: 1px solid #444;
+        padding: 6px;
+    }
+
+    QPushButton:hover {
+        background-color: #3a3a3a;
+    }
+
+    QTableWidget {
+        background-color: #252526;
+    }
+
+    """)
 
     window = Window()
     window.show()
