@@ -27,12 +27,21 @@ class DropTable(QTableWidget):
 
     def __init__(self):
         super().__init__()
+
         self.setAcceptDrops(True)
+        self.setDragDropMode(QTableWidget.DropOnly)
 
     def dragEnterEvent(self, event):
 
         if event.mimeData().hasUrls():
-            event.accept()
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
         else:
             event.ignore()
 
@@ -41,10 +50,15 @@ class DropTable(QTableWidget):
         paths = []
 
         for url in event.mimeData().urls():
-            paths.append(url.toLocalFile())
+            path = url.toLocalFile()
 
-        self.files_dropped.emit(paths)
+            if path:
+                paths.append(path)
 
+        if paths:
+            self.files_dropped.emit(paths)
+
+        event.acceptProposedAction()
 
 class WorkerThread(QThread):
 
